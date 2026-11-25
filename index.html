@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Selfie form – reference</title>
 <!--
-  REFERENCE IMPLEMENTATION – selfie upload
+  REFERENCE IMPLEMENTATION – selfie upload (OpenAI image generation)
   ==========================================================
   POST {WEBHOOK_URL} as multipart/form-data with:
     name          text
@@ -13,7 +13,15 @@
     phone         text
     selfie        file  (jpeg / png / webp, max 10 MB)
     landing_page  text  (URL the form was submitted from)
-  Expects back:  { "url": "https://..." }
+
+  The webhook must answer only once the image is finished (n8n Webhook node:
+  Respond = "When Last Node Finishes" or a "Respond to Webhook" node).
+  Any of these response shapes is accepted:
+    { "data": [ { "b64_json": "..." } ] }   raw OpenAI /v1/images/edits response
+    { "b64_json": "..." }                   or { "image": "<base64 or data: URI>" }
+    { "url": "https://..." }                if you host the image yourself
+    binary image body (Content-Type: image/*)
+  A one-item array wrapping any of the JSON shapes also works.
 -->
 <style>
   :root {
@@ -124,10 +132,10 @@
     <p id="status" role="status" aria-live="polite"></p>
   </form>
 
-  <!-- Shown after a successful upload, using the URL returned by the webhook -->
+  <!-- Shown after a successful upload, using the image returned by the webhook -->
   <div id="result" hidden>
-    <span class="label">Uploaded image</span>
-    <img id="result-img" alt="Uploaded selfie">
+    <span class="label">Your 1986 photo</span>
+    <img id="result-img" alt="Generated 1986-style photo">
   </div>
 </div>
 
@@ -136,6 +144,8 @@
   const WEBHOOK_URL = "https://engageteam.app.n8n.cloud/webhook/48ed49fe-0169-485c-9758-5f814e29defb";
   const MAX_SIZE_MB = 10;
   const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+  // The webhook now stays open while OpenAI generates the image, so allow for a long wait.
+  const REQUEST_TIMEOUT_MS = 150000;
   // ──────────────────────────────────────────────────────────────────────
 
   const form      = document.getElementById("selfie-form");
@@ -148,6 +158,7 @@
   const resultImg = document.getElementById("result-img");
 
   let selectedFile = null;   // set by the file picker OR by drag-and-drop
+  let resultObjectUrl = null; // blob: URL of the last generated image, if any
 
   function setStatus(message, type) {
     statusEl.textContent = message;
@@ -202,23 +213,41 @@
     if (file) selectFile(file);
   });
 
-  // Resolves once the image at `url` loads; retries while Cloudinary is still generating it.
-  const IMAGE_RETRY_MS = 5000;
-  const IMAGE_MAX_TRIES = 18;   // 18 x 5 s = 90 s
-  function waitForImage(url) {
+  // ── Reading the webhook response ──────────────────────────────────────
+  // Base64 image data starts with a recognisable signature per format.
+  function mimeFromBase64(b64) {
+    if (b64.startsWith("/9j/"))   return "image/jpeg";
+    if (b64.startsWith("iVBOR"))  return "image/png";
+    if (b64.startsWith("UklGR"))  return "image/webp";
+    return "image/png";
+  }
+
+  // Turns whatever JSON the webhook returned into something usable as <img src>.
+  function imageSrcFromJson(data) {
+    let item = Array.isArray(data) ? data[0] : data;
+    if (!item) return null;
+    // Raw OpenAI response: { data: [ { b64_json } ] }
+    if (Array.isArray(item.data) && item.data[0]) item = item.data[0];
+
+    const b64 = item.b64_json || item.image || item.base64;
+    if (typeof b64 === "string" && b64.trim()) {
+      const clean = b64.trim();
+      if (clean.startsWith("data:image/")) return clean;
+      const compact = clean.replace(/\s+/g, "");
+      return "data:" + mimeFromBase64(compact) + ";base64," + compact;
+    }
+
+    const url = String(item.url || "").trim().replace(/^http:\/\//, "https://");
+    if (url.startsWith("https://")) return url;
+    return null;
+  }
+
+  // Resolves once the browser has actually decoded the image.
+  function loadImage(img, src) {
     return new Promise((resolve, reject) => {
-      let tries = 0;
-      const attempt = () => {
-        tries += 1;
-        const probe = new Image();
-        probe.onload = () => resolve();
-        probe.onerror = () => {
-          if (tries >= IMAGE_MAX_TRIES) return reject(new Error("Image was not ready in time"));
-          setTimeout(attempt, IMAGE_RETRY_MS);
-        };
-        probe.src = url;
-      };
-      attempt();
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Returned image could not be displayed"));
+      img.src = src;
     });
   }
 
@@ -244,37 +273,49 @@
     body.append("landing_page", window.location.href);
 
     button.disabled = true;
-    setStatus("Uploading…");
+    // Generation happens inside this one request, so the wait is here.
+    setStatus("Creating your 1986 photo… this can take up to a minute.");
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
       // No headers: the browser sets multipart/form-data + boundary itself.
-      const response = await fetch(WEBHOOK_URL, { method: "POST", body });
+      const response = await fetch(WEBHOOK_URL, { method: "POST", body, signal: controller.signal });
       if (!response.ok) throw new Error("Server responded with " + response.status);
 
-      const data = await response.json();          // expected: { "url": "https://..." }
-      console.log("Webhook response:", JSON.stringify(data));
+      let src;
+      let newObjectUrl = null;
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
 
-      // Accept { url } or [ { url } ], trim spaces, upgrade http:// to https://
-      const item = Array.isArray(data) ? data[0] : data;
-      const url = String((item && item.url) || "").trim().replace(/^http:\/\//, "https://");
-      if (!url.startsWith("https://")) {
-        throw new Error("Response did not contain an image URL");
+      if (contentType.startsWith("image/")) {
+        // Webhook answered with the image file itself
+        newObjectUrl = URL.createObjectURL(await response.blob());
+        src = newObjectUrl;
+      } else {
+        const data = await response.json();
+        src = imageSrcFromJson(data);
+        if (!src) {
+          console.log("Webhook response keys:", Object.keys(Array.isArray(data) ? (data[0] || {}) : data));
+          throw new Error("Response did not contain an image");
+        }
       }
 
-      // The styled image can take ~30 s to generate. Until it is ready Cloudinary
-      // answers 423, so keep trying until the image actually loads.
-      setStatus("Creating your 1986 photo… this can take up to a minute.");
-      await waitForImage(url);
+      await loadImage(resultImg, src);
+      if (resultObjectUrl) URL.revokeObjectURL(resultObjectUrl);
+      resultObjectUrl = newObjectUrl;
 
-      resultImg.src = url;
       result.hidden = false;
       form.reset();
       clearFile();
-      setStatus("Uploaded.", "ok");
+      setStatus("Your photo is ready.", "ok");
     } catch (err) {
       console.error("Selfie upload failed:", err);
-      setStatus("Upload failed. Please try again.", "error");
+      setStatus(err.name === "AbortError"
+        ? "This is taking longer than expected. Please try again."
+        : "Upload failed. Please try again.", "error");
     } finally {
+      clearTimeout(timer);
       button.disabled = false;
     }
   });
