@@ -16,7 +16,9 @@
 
   The webhook must answer only once the image is finished (n8n Webhook node:
   Respond = "When Last Node Finishes" or a "Respond to Webhook" node).
-  Any of these response shapes is accepted:
+  Expected response (both images, base64 or data: URI or https URL):
+    { "image": "<framed>", "unframed": "<without frame>" }
+  These older single-image shapes still work (only one image is shown):
     { "data": [ { "b64_json": "..." } ] }   raw OpenAI /v1/images/edits response
     { "b64_json": "..." }                   or { "image": "<base64 or data: URI>" }
     { "url": "https://..." }                if you host the image yourself
@@ -97,6 +99,7 @@
   #status.ok { color: var(--denim); }
   #result { margin-top: 24px; }
   #result img { display: block; width: 100%; border-radius: 4px; }
+  #result .shot + .shot { margin-top: 24px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -134,8 +137,14 @@
 
   <!-- Shown after a successful upload, using the image returned by the webhook -->
   <div id="result" hidden>
-    <span class="label">Your 1986 photo</span>
-    <img id="result-img" alt="Generated 1986-style photo">
+    <div class="shot">
+      <span class="label">Your 1986 photo</span>
+      <img id="result-img" alt="Generated 1986-style photo in the betterhomes frame">
+    </div>
+    <div class="shot" id="unframed-wrap" hidden>
+      <span class="label">Without the frame</span>
+      <img id="unframed-img" alt="Generated 1986-style photo without the frame">
+    </div>
   </div>
 </div>
 
@@ -156,6 +165,12 @@
   const statusEl  = document.getElementById("status");
   const result    = document.getElementById("result");
   const resultImg = document.getElementById("result-img");
+  const unframedWrap = document.getElementById("unframed-wrap");
+  const unframedImg  = document.getElementById("unframed-img");
+
+  // Last generated pair, kept for the second submission step:
+  // window.selfieResult = { framed: "<img src>", unframed: "<img src>" | null }
+  window.selfieResult = null;
 
   let selectedFile = null;   // set by the file picker OR by drag-and-drop
   let resultObjectUrl = null; // blob: URL of the last generated image, if any
@@ -222,24 +237,35 @@
     return "image/png";
   }
 
-  // Turns whatever JSON the webhook returned into something usable as <img src>.
+  // Turns one value (base64, data: URI or URL) into something usable as <img src>.
+  function srcFromValue(value) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    const clean = value.trim();
+    if (clean.startsWith("data:image/")) return clean;
+    if (/^https?:\/\//i.test(clean)) return clean.replace(/^http:\/\//i, "https://");
+    const compact = clean.replace(/\s+/g, "");
+    return "data:" + mimeFromBase64(compact) + ";base64," + compact;
+  }
+
+  // The webhook may wrap its JSON in a one-item array.
+  function firstItem(data) {
+    return (Array.isArray(data) ? data[0] : data) || null;
+  }
+
+  // Framed image: { image } from the workflow, or one of the older shapes.
   function imageSrcFromJson(data) {
-    let item = Array.isArray(data) ? data[0] : data;
+    let item = firstItem(data);
     if (!item) return null;
     // Raw OpenAI response: { data: [ { b64_json } ] }
     if (Array.isArray(item.data) && item.data[0]) item = item.data[0];
+    return srcFromValue(item.image || item.framed || item.b64_json || item.base64)
+        || srcFromValue(item.url);
+  }
 
-    const b64 = item.b64_json || item.image || item.base64;
-    if (typeof b64 === "string" && b64.trim()) {
-      const clean = b64.trim();
-      if (clean.startsWith("data:image/")) return clean;
-      const compact = clean.replace(/\s+/g, "");
-      return "data:" + mimeFromBase64(compact) + ";base64," + compact;
-    }
-
-    const url = String(item.url || "").trim().replace(/^http:\/\//, "https://");
-    if (url.startsWith("https://")) return url;
-    return null;
+  // Image without the frame: { unframed }. Null if the webhook did not send one.
+  function unframedSrcFromJson(data) {
+    const item = firstItem(data);
+    return item ? srcFromValue(item.unframed) : null;
   }
 
   // Resolves once the browser has actually decoded the image.
@@ -285,6 +311,7 @@
       if (!response.ok) throw new Error("Server responded with " + response.status);
 
       let src;
+      let unframedSrc = null;
       let newObjectUrl = null;
       const contentType = (response.headers.get("content-type") || "").toLowerCase();
 
@@ -295,6 +322,7 @@
       } else {
         const data = await response.json();
         src = imageSrcFromJson(data);
+        unframedSrc = unframedSrcFromJson(data);
         if (!src) {
           console.log("Webhook response keys:", Object.keys(Array.isArray(data) ? (data[0] || {}) : data));
           throw new Error("Response did not contain an image");
@@ -302,6 +330,10 @@
       }
 
       await loadImage(resultImg, src);
+      if (unframedSrc) await loadImage(unframedImg, unframedSrc);
+      else unframedImg.removeAttribute("src");
+      unframedWrap.hidden = !unframedSrc;
+      window.selfieResult = { framed: src, unframed: unframedSrc };
       if (resultObjectUrl) URL.revokeObjectURL(resultObjectUrl);
       resultObjectUrl = newObjectUrl;
 
